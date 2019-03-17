@@ -1,5 +1,7 @@
 import logging
 
+from aiohttp import ClientSession
+from .aiohttp import OAuthRequest
 from .aiohttp import AsyncOAuth1Client
 from .aiohttp import AsyncOAuth2Client
 from .errors import (
@@ -10,6 +12,8 @@ from ..oauth2.rfc7636 import create_s256_code_challenge
 from ..common.urls import urlparse
 from ..common.security import generate_token
 from ..consts import default_user_agent
+
+from typing import Union
 
 __all__ = ['OAUTH_CLIENT_PARAMS', 'AsyncOAuthClient']
 
@@ -100,7 +104,7 @@ class AsyncOAuthClient(object):
         if server_metadata_url:
             self._fetch_server_metadata(server_metadata_url)
 
-    def generate_authorize_redirect(
+    async def generate_authorize_redirect(
             self, redirect_uri=None, save_request_token=None, **kwargs):
         """Generate the authorization url and state for HTTP redirect.
 
@@ -119,7 +123,7 @@ class AsyncOAuthClient(object):
         if self.authorize_params:
             kwargs.update(self.authorize_params)
 
-        with self._get_session() as session:
+        def cb(session: Union[AsyncOAuth1Client, AsyncOAuth2Client]):
             if self.request_token_url:
                 session.redirect_uri = redirect_uri
                 params = {}
@@ -138,7 +142,28 @@ class AsyncOAuthClient(object):
             return session.create_authorization_url(
                 authorization_endpoint, **kwargs)
 
-    def fetch_access_token(self, redirect_uri=None, request_token=None,
+        # with self._get_session() as session:
+        #     if self.request_token_url:
+        #         session.redirect_uri = redirect_uri
+        #         params = {}
+        #         if self.request_token_params:
+        #             params.update(self.request_token_params)
+        #         token = session.fetch_request_token(
+        #             self.request_token_url, **params
+        #         )
+        #         # remember oauth_token, oauth_token_secret
+        #         save_request_token(token)
+        #         url = session.create_authorization_url(
+        #             authorization_endpoint,  **kwargs)
+        #         return url, None
+        #
+        #     session.redirect_uri = redirect_uri
+        #     return session.create_authorization_url(
+        #         authorization_endpoint, **kwargs)
+
+        return await self._get_session(cb)
+
+    async def fetch_access_token(self, redirect_uri=None, request_token=None,
                            **params):
         """Fetch access token in one step.
 
@@ -152,7 +177,7 @@ class AsyncOAuthClient(object):
         if not token_endpoint and not self.request_token_url:
             token_endpoint = self.server_metadata.get('token_endpoint')
 
-        with self._get_session() as session:
+        async def cb(session: Union[AsyncOAuth1Client, AsyncOAuth2Client]):
             if self.request_token_url:
                 session.redirect_uri = redirect_uri
                 if request_token is None:
@@ -163,7 +188,8 @@ class AsyncOAuthClient(object):
                 token.update(params)
                 session.token = token
                 kwargs = self.access_token_params or {}
-                token = session.fetch_access_token(token_endpoint, **kwargs)
+                # token = session.fetch_access_token(token_endpoint, **kwargs)
+                token = await session._fetch_token(token_endpoint, **kwargs)
                 session.redirect_uri = None
             else:
                 session.redirect_uri = redirect_uri
@@ -171,29 +197,34 @@ class AsyncOAuthClient(object):
                 if self.access_token_params:
                     kwargs.update(self.access_token_params)
                 kwargs.update(params)
-                token = session.fetch_access_token(token_endpoint, **kwargs)
+                # token = session.fetch_access_token(token_endpoint, **kwargs)
+                token = await session._fetch_token(token_endpoint, **kwargs)
             return token
 
-    def _get_session(self):
-        if self.request_token_url:
-            session = AsyncOAuth1Client(
-                self.client_id, self.client_secret,
-                **self.client_kwargs
-            )
-        else:
-            session = AsyncOAuth2Client(
-                client_id=self.client_id,
-                client_secret=self.client_secret,
-                refresh_token_url=self.refresh_token_url,
-                refresh_token_params=self.refresh_token_params,
-                **self.client_kwargs
-            )
-            # only OAuth2 has compliance_fix currently
-            if self.compliance_fix:
-                self.compliance_fix(session)
+        # with self._get_session() as session:
+        #     if self.request_token_url:
+        #         session.redirect_uri = redirect_uri
+        #         if request_token is None:
+        #             raise MissingRequestTokenError()
+        #         # merge request token with verifier
+        #         token = {}
+        #         token.update(request_token)
+        #         token.update(params)
+        #         session.token = token
+        #         kwargs = self.access_token_params or {}
+        #         token = session.fetch_access_token(token_endpoint, **kwargs)
+        #         session.redirect_uri = None
+        #     else:
+        #         session.redirect_uri = redirect_uri
+        #         kwargs = {}
+        #         if self.access_token_params:
+        #             kwargs.update(self.access_token_params)
+        #         kwargs.update(params)
+        #         token = session.fetch_access_token(token_endpoint, **kwargs)
+        #     return token
 
-        # session.headers['User-Agent'] = self.DEFAULT_USER_AGENT
-        return session
+        return await self._get_session(cb)
+
 
     def add_code_challenge(self, save_code_verifier, kwargs):
         code_challenge_method = self._kwargs.get('code_challenge_method')
@@ -208,10 +239,11 @@ class AsyncOAuthClient(object):
             kwargs['code_challenge_method'] = code_challenge_method
         return kwargs
 
-    def request(self, method, url, token=None, **kwargs):
+    async def request(self, method, url, token=None, **kwargs):
         if self.api_base_url and not url.startswith(('https://', 'http://')):
             url = urlparse.urljoin(self.api_base_url, url)
-        with self._get_session() as session:
+
+        async def cb(session: Union[AsyncOAuth1Client, AsyncOAuth2Client]):
             if kwargs.get('withhold_token'):
                 return session.request(method, url, **kwargs)
 
@@ -222,7 +254,22 @@ class AsyncOAuthClient(object):
                 raise MissingTokenError()
 
             session.token = token
-            return session.request(method, url, **kwargs)
+            return await session.request(method, url, **kwargs)
+
+        # with self._get_session() as session:
+        #     if kwargs.get('withhold_token'):
+        #         return session.request(method, url, **kwargs)
+        #
+        #     request = kwargs.pop('request', None)
+        #     if token is None and self._fetch_token and request:
+        #         token = self._fetch_token(request)
+        #     if token is None:
+        #         raise MissingTokenError()
+        #
+        #     session.token = token
+        #     return session.request(method, url, **kwargs)
+
+        return await self._get_session(cb)
 
     def get(self, url, **kwargs):
         """Invoke GET http request.
@@ -273,3 +320,30 @@ class AsyncOAuthClient(object):
         resp = self.get(url, withhold_token=True)
         data = resp.json()
         self.server_metadata = data
+
+    async def _get_session(self, cb):
+        async with ClientSession(request_class=OAuthRequest) as client_session:
+            if self.request_token_url:
+                session = AsyncOAuth1Client(
+                    client_session,
+                    self.client_id, self.client_secret,
+                    **self.client_kwargs
+                )
+            else:
+                session = AsyncOAuth2Client(
+                    client_session,
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    refresh_token_url=self.refresh_token_url,
+                    refresh_token_params=self.refresh_token_params,
+                    **self.client_kwargs
+                )
+                # only OAuth2 has compliance_fix currently
+                if self.compliance_fix:
+                    self.compliance_fix(session)
+
+            # session.headers['User-Agent'] = self.DEFAULT_USER_AGENT
+
+            # import inspect
+            # inspect.iscoroutinefunction(cb)
+            return await cb(session)
